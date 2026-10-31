@@ -20,7 +20,13 @@ export class Store {
   readonly loading = signal(true);
   readonly notice = signal('');
   readonly connectionError = signal('');
+  readonly locationChanging = signal(false);
+  readonly pendingLocationId = signal<number | null>(null);
+  readonly locationError = signal('');
   private initialized = false;
+  private reloadSequence = 0;
+  private locationSequence = 0;
+  private sessionSequence = 0;
   private toastTimer?: ReturnType<typeof setTimeout>;
 
   async initialize(): Promise<void> {
@@ -30,24 +36,58 @@ export class Store {
     catch (error) { if (!(error instanceof HttpErrorResponse && error.status === 401)) this.connectionError.set(errorMessage(error)); }
     finally { this.loading.set(false); }
   }
-  async reload(): Promise<void> {
-    const state = await this.get<AppState>('/api/state');
-    this.state.set(state);
-    this.connectionError.set('');
+  async reload(locationId?: number): Promise<void> {
+    const sequence = ++this.reloadSequence;
+    const selected = locationId ?? this.state()?.locationId;
+    const state = await this.get<AppState>(`/api/state${selected ? '?locationId=' + encodeURIComponent(selected) : ''}`);
+    if (sequence === this.reloadSequence) {
+      this.state.set(state);
+      this.connectionError.set('');
+      this.locationError.set('');
+    }
+  }
+  async changeLocation(locationId: number): Promise<boolean> {
+    const sequence = ++this.locationSequence;
+    this.locationChanging.set(true);
+    this.pendingLocationId.set(locationId);
+    this.locationError.set('');
+    try {
+      await this.reload(locationId);
+      return sequence === this.locationSequence && this.state()?.locationId === locationId;
+    } catch (error) {
+      if (sequence === this.locationSequence && this.state()) this.locationError.set(errorMessage(error));
+      return false;
+    } finally {
+      if (sequence === this.locationSequence) {
+        this.pendingLocationId.set(null);
+        this.locationChanging.set(false);
+      }
+    }
+  }
+  private invalidatePendingState(): void {
+    this.sessionSequence++;
+    this.reloadSequence++;
+    this.locationSequence++;
+    this.pendingLocationId.set(null);
+    this.locationChanging.set(false);
+    this.locationError.set('');
   }
   async login(email: string, password: string): Promise<void> {
+    this.invalidatePendingState();
     await firstValueFrom(this.http.get('/sanctum/csrf-cookie', { withCredentials: true, responseType: 'text' }));
     await this.post('/api/login', { email, password });
     await this.reload();
   }
   async logout(): Promise<void> {
     await this.post('/api/logout', {});
+    this.invalidatePendingState();
     this.state.set(null);
   }
-  private async guard<T>(request: Promise<T>): Promise<T> {
+  private async guard<T>(request: Promise<T>, session = this.sessionSequence): Promise<T> {
     try { return await request; }
     catch (error) {
-      if (error instanceof HttpErrorResponse && error.status === 401 && this.state()) {
+      if (error instanceof HttpErrorResponse && error.status === 401 && session === this.sessionSequence && this.state()) {
+        this.invalidatePendingState();
         this.state.set(null);
         this.connectionError.set('Tu sesión terminó. Vuelve a entrar para continuar.');
       }
